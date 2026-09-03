@@ -111,6 +111,48 @@ std::string tokens_to_output_formatted_string(const llama_context *ctx, const ll
     return out;
 }
 
+// See cap-llama.h's doc comment. Same lead/continuation-byte classification
+// as jni.cpp's sanitize_utf8() (whole-string truncation on the JNI
+// boundary) — this is the per-token counterpart, buffering instead of
+// truncating so a character split across multiple BPE tokens survives
+// intact rather than triggering a truncation (or, before this existed,
+// each partial byte leaking into the visible/streamed text as literal
+// "byte: \xNN" debug text — reported live 2026-08-21, e.g. "\x90byte:
+// \xbe" appearing mid-reply for non-Latin/emoji output).
+std::string format_token_utf8_safe(const llama_context *ctx, const llama_token token, std::string &pending)
+{
+    std::string piece = token == -1 ? "" : common_token_to_piece(ctx, token);
+    pending += piece;
+
+    size_t len = pending.size();
+    size_t i = 0;
+    size_t last_complete = 0;
+    while (i < len)
+    {
+        unsigned char c = static_cast<unsigned char>(pending[i]);
+        int seq_len;
+        if ((c & 0x80) == 0x00) seq_len = 1;        // 0xxxxxxx
+        else if ((c & 0xE0) == 0xC0) seq_len = 2;   // 110xxxxx
+        else if ((c & 0xF0) == 0xE0) seq_len = 3;   // 1110xxxx
+        else if ((c & 0xF8) == 0xF0) seq_len = 4;   // 11110xxx
+        else { i += 1; last_complete = i; continue; } // not a valid lead byte (stray continuation byte, or 0xF8-0xFF) — drop it and resync, rather than truncating the whole stream over one bad byte
+        if (i + static_cast<size_t>(seq_len) > len) break; // sequence runs past what's arrived so far — hold it, wait for the next token(s)
+        bool valid = true;
+        for (int k = 1; k < seq_len; k++)
+        {
+            unsigned char cont = static_cast<unsigned char>(pending[i + k]);
+            if ((cont & 0xC0) != 0x80) { valid = false; break; } // expected a continuation byte (10xxxxxx) and didn't find one
+        }
+        if (!valid) { i += 1; last_complete = i; continue; }
+        i += seq_len;
+        last_complete = i;
+    }
+
+    std::string ready = pending.substr(0, last_complete);
+    pending = pending.substr(last_complete);
+    return ready;
+}
+
 std::string tokens_to_str(llama_context *ctx, const std::vector<llama_token>::const_iterator begin, const std::vector<llama_token>::const_iterator end)
 {
     std::string ret;

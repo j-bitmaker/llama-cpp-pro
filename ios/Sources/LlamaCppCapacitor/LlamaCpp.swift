@@ -213,6 +213,16 @@ struct MinjaCaps {
     private var nativeContexts: [Int64: UnsafeMutableRawPointer] = [:]
     private var contextIdToNative: [Int: Int64] = [:]
     private var contextCounter: Int = 0
+    // PATCH (2026-08-20, local-ai per-token-streaming-ios): set once by
+    // LlamaCppPlugin.load(), so completion(contextId:params:completion:) below can forward
+    // per-token events to the Capacitor bridge. Mirrors Android's `LlamaCpp(Context,
+    // LlamaCppPlugin)` constructor reference (docs/decisions.md's 2026-08-20 Android
+    // streaming-fix entry) but as a closure instead of holding a `LlamaCppPlugin`/`CAPPlugin`
+    // reference directly — more idiomatic Swift, and sidesteps having to import/reference
+    // the plugin type from this file. `nil` (e.g. if LlamaCppPlugin.load() is never called,
+    // such as in a hypothetical unit-test context that constructs LlamaCpp() directly) just
+    // means completion() falls back to the non-streaming path — never a hard failure.
+    var onPartialToken: ((_ contextId: Int, _ token: String) -> Void)?
     // Default aligned with the isomorphic limit (parity with WASM_MAX_CONCURRENT_MODELS = 5).
     private var contextLimit: Int = ModelAdmissionController.maxConcurrentModels
     private var nativeLogEnabled: Bool = false
@@ -571,9 +581,35 @@ struct MinjaCaps {
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        // PATCH (2026-08-20, local-ai per-token-streaming-ios): mirrors the JS wrapper's own
+        // gate (dist/esm/index.js's completion(): `emit_partial_completion: !!callback`) and
+        // Android's identical check (jni.cpp) — only take the streaming native call when a
+        // JS-side listener is actually registered (params carries emit_partial_completion)
+        // AND this instance has been wired with onPartialToken (see LlamaCppPlugin.load()).
+        // NSNumber cast because `params` came in through JSONSerialization/CAPPluginCall as
+        // `[String: Any]` — a JSON `true` bridges to Swift as NSNumber, not Bool, here.
+        let emitPartial = (params["emit_partial_completion"] as? NSNumber)?.boolValue ?? false
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let completionResult = try LlamaNativeBridge.runCompletion(contextId: nativeId, paramsJson: paramsJson)
+                let completionResult: [String: Any]
+                if emitPartial, let onPartialToken = self?.onPartialToken {
+                    do {
+                        completionResult = try LlamaNativeBridge.runCompletionStream(
+                            contextId: nativeId,
+                            paramsJson: paramsJson
+                        ) { token in
+                            onPartialToken(contextId, token)
+                        }
+                    } catch LlamaNativeBridge.Failure.missingSymbol {
+                        // TODO(mac): see runCompletionStream()'s doc comment, point 1 — fails
+                        // closed to today's non-streaming behavior instead of erroring the
+                        // whole completion when the xcframework predates llama_completion_stream.
+                        completionResult = try LlamaNativeBridge.runCompletion(contextId: nativeId, paramsJson: paramsJson)
+                    }
+                } else {
+                    completionResult = try LlamaNativeBridge.runCompletion(contextId: nativeId, paramsJson: paramsJson)
+                }
                 completion(.success(completionResult))
             } catch let error as LlamaNativeBridge.Failure {
                 completion(.failure(.operationFailed(error.localizedDescription)))

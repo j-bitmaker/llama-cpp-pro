@@ -83,6 +83,41 @@ public class LlamaCppPlugin: CAPPlugin, CAPBridgedPlugin {
     
     private let implementation = LlamaCpp()
 
+    // PATCH (2026-08-20, local-ai per-token-streaming-ios): closes docs/decisions.md's "iOS:
+    // notifyListeners unimplemented in llama-cpp-pro's Swift plugin entirely, not just for
+    // tokens" entry (2026-08-20) — confirmed there via `grep -rc notifyListeners
+    // ios/Sources` returning zero across all four Swift files. This is the first
+    // `notifyListeners` call added to this plugin; scoped to `@LlamaCpp_onToken` only
+    // (mirrors Android's fix, which was also token-streaming-scoped, not a general fix for
+    // every event the JS wrapper might expect from native — see that entry's "broader than
+    // the Android gap" framing for events this still doesn't cover).
+    //
+    // TODO(mac):
+    // 1. Confirm `override func load()` is the right lifecycle hook here — mirrors Android's
+    //    `LlamaCppPlugin.load()` (which is where `LlamaCpp(context, plugin)` gets its
+    //    back-reference), but wasn't verified against Capacitor's actual iOS `CAPPlugin`
+    //    lifecycle since there's no Xcode here to build against.
+    // 2. Confirm `notifyListeners(_:data:)`'s exact signature/label on the installed
+    //    Capacitor iOS SDK version — written from general Capacitor-iOS-plugin knowledge,
+    //    not copied from an existing call site in this file (there wasn't one, per the
+    //    zero-occurrences finding above).
+    // 3. `onPartialToken` fires from `LlamaCpp.completion()`'s background dispatch queue,
+    //    not the main thread — confirm `notifyListeners` doesn't need a
+    //    `DispatchQueue.main.async` hop on iOS (Android's `Plugin.notifyListeners()` was
+    //    called directly from the JNI thread with no such hop needed; unconfirmed whether
+    //    iOS's Capacitor bridge has the same tolerance).
+    public override func load() {
+        super.load()
+        implementation.onPartialToken = { [weak self] contextId, token in
+            var tokenResult = JSObject()
+            tokenResult["token"] = token
+            var event = JSObject()
+            event["contextId"] = contextId
+            event["tokenResult"] = tokenResult
+            self?.notifyListeners("@LlamaCpp_onToken", data: event)
+        }
+    }
+
     // MARK: - Core initialization and management
     
     @objc func toggleNativeLog(_ call: CAPPluginCall) {

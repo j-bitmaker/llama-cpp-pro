@@ -26,9 +26,21 @@ public class LlamaCppPlugin extends Plugin {
     @Override
     public void load() {
         super.load();
-        // Initialize implementation with context
-        implementation = new LlamaCpp(getContext());
+        // `this` lets LlamaCpp.emitPartialToken() reach emitTokenEvent() below for per-token
+        // streaming (jni.cpp's completion loop -> LlamaCpp.emitPartialToken() -> here) —
+        // see that method's doc comment / docs/decisions.md's 2026-08-20 streaming-fix entry.
+        implementation = new LlamaCpp(getContext(), this);
         Log.i(TAG, "LlamaCppPlugin loaded successfully");
+    }
+
+    /**
+     * Thin public wrapper around `Plugin.notifyListeners()` (which is `protected` — `LlamaCpp`
+     * holds a reference to this plugin but isn't a `Plugin` subclass itself, so it can't call
+     * that directly across the `com.getcapacitor` package boundary). Only caller is
+     * `LlamaCpp.emitPartialToken()`.
+     */
+    void emitTokenEvent(JSObject event) {
+        notifyListeners("@LlamaCpp_onToken", event);
     }
 
     // MARK: - Core initialization and management

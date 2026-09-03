@@ -25,6 +25,20 @@ namespace capllama {
 
 std::string tokens_to_output_formatted_string(const llama_context *ctx, const llama_token token);
 
+// Per-token text for the actual generated/streamed output (as opposed to
+// tokens_to_output_formatted_string()'s debug-only "byte: \xNN" formatting,
+// still correct for probs/debug listings) — buffers a token's raw bytes
+// across calls in `pending` so a multi-byte UTF-8 character split across
+// several tokens (common with byte-level BPE tokenizers, emoji/CJK/
+// Cyrillic in particular) is held back and reassembled instead of leaking
+// each individual incomplete byte into the text as literal "byte: \x90"-
+// style debug output. `pending` is owned by the caller, must start empty,
+// and persists for the whole generation; any bytes still in it once
+// generation ends are a genuinely incomplete tail and should just be
+// dropped (matches jni.cpp's sanitize_utf8()'s "never emit obviously
+// broken bytes" philosophy) rather than flushed as-is.
+std::string format_token_utf8_safe(const llama_context *ctx, const llama_token token, std::string &pending);
+
 std::string tokens_to_str(llama_context *ctx, const std::vector<llama_token>::const_iterator begin, const std::vector<llama_token>::const_iterator end);
 
 lm_ggml_type kv_cache_type_from_str(const std::string & s);

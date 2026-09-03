@@ -25,6 +25,15 @@ set(
     ${LLAMACPP_LIB_DIR}/ggml-cpu/quants.c
     ${LLAMACPP_LIB_DIR}/ggml-cpu/traits.cpp
     ${LLAMACPP_LIB_DIR}/ggml-cpu/repack.cpp
+    # ARM64 NEON/dotprod kernels (arch-specific overrides of the generic
+    # quants.c/repack.cpp above — coexist fine since arch-fallback.h only
+    # renames symbols when LM_GGML_CPU_GENERIC is defined, which it no
+    # longer is below). Without these, every quantized matmul/GEMV silently
+    # fell back to the unvectorized scalar path on every Android device,
+    # not just weak ones — see docs/decisions.md (local-ai) 2026-08-21.
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/arch/arm/quants.c
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/arch/arm/repack.cpp
+    ${LLAMACPP_LIB_DIR}/ggml-cpu/arch/arm/cpu-feats.cpp
     ${LLAMACPP_LIB_DIR}/ggml-cpu/unary-ops.cpp
     ${LLAMACPP_LIB_DIR}/ggml-cpu/binary-ops.cpp
     ${LLAMACPP_LIB_DIR}/ggml-cpu/vec.cpp
@@ -108,7 +117,6 @@ function(build_library_arm64 target_name)
         -O3
         -DNDEBUG
         -DLM_GGML_USE_CPU
-        -DLM_GGML_CPU_GENERIC
         -fno-finite-math-only
         -funroll-loops
     )

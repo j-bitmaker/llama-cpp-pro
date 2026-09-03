@@ -28,6 +28,66 @@
 
 namespace jni_utils {
 
+// A byte-level BPE tokenizer (used by Qwen and most current models) can
+// split a single Unicode character — emoji in particular — across multiple
+// tokens, each contributing raw bytes with no obligation to land on a UTF-8
+// character boundary, and detokenization/formatting fallbacks for a token
+// with no clean text mapping can also inject a stray byte outside any valid
+// sequence. Either way, generated_text can end up not being valid UTF-8 by
+// the time a hard n_predict cutoff (or in principle an interrupted stream)
+// ends generation. env->NewStringUTF() validates strictly and calls abort()
+// on invalid input when CheckJNI is active — this crashed the whole app
+// process live, 2026-08-19 ("JNI DETECTED ERROR IN APPLICATION: input is
+// not valid Modified UTF-8: illegal continuation byte", from this exact
+// function via Java_..._completionNative's result-map construction).
+//
+// 2026-08-20 correction (real-device regression, perf-tuning-plan device
+// pass): the original version of this function TRUNCATED the whole string
+// at the first invalid byte (`return s.substr(0, i)`), on the assumption
+// that an invalid byte can only mean "generation got cut off mid-character
+// right here, discard the (incomplete) rest". That assumption doesn't hold
+// for a stray single bad byte in the *middle* of an otherwise-complete,
+// naturally-EOS-terminated response (confirmed live: a 315-token reply,
+// `has_next_token=false`/`stopped_eos=1`, i.e. NOT a hard n_predict cutoff,
+// still lost ~60% of its content this way — a lone malformed byte
+// mid-string, most likely a byte-level BPE token whose raw output wasn't a
+// complete UTF-8 sequence on its own, silently amputated everything after
+// it). Fixed to only DROP the specific offending byte(s) and keep scanning,
+// so one bad byte loses at most one character instead of the rest of the
+// reply — `out` is still built exclusively from validated complete
+// sequences, so it's still impossible to hand `NewStringUTF()` anything
+// invalid (the original bug this function exists for). The one case that's
+// still a truncation, not a skip, is a multi-byte sequence that runs past
+// the *end* of the string — that can only legitimately happen at the very
+// tail (every other position has more bytes following it to check), which
+// is exactly the "cut off mid-character by a hard boundary" case the
+// original comment described; nothing meaningful is lost by stopping there.
+std::string sanitize_utf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t len = s.size();
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int seq_len;
+        if ((c & 0x80) == 0x00) seq_len = 1;      // 0xxxxxxx
+        else if ((c & 0xE0) == 0xC0) seq_len = 2; // 110xxxxx
+        else if ((c & 0xF0) == 0xE0) seq_len = 3; // 1110xxxx
+        else if ((c & 0xF8) == 0xF0) seq_len = 4; // 11110xxx
+        else { i += 1; continue; }                // not a valid lead byte (stray continuation byte, or 0xF8-0xFF) — drop just this byte, keep scanning
+        if (i + static_cast<size_t>(seq_len) > len) break; // sequence runs past the end of the string — only possible at the tail, stop here
+        bool validContinuation = true;
+        for (int k = 1; k < seq_len; k++) {
+            unsigned char cont = static_cast<unsigned char>(s[i + k]);
+            if ((cont & 0xC0) != 0x80) { validContinuation = false; break; } // expected a continuation byte (10xxxxxx) and didn't find one
+        }
+        if (!validContinuation) { i += 1; continue; } // malformed sequence — drop just the lead byte, keep scanning (a mis-set lead byte is more often noise than a real multi-byte start)
+        out.append(s, i, static_cast<size_t>(seq_len));
+        i += static_cast<size_t>(seq_len);
+    }
+    return out;
+}
+
 std::string jstring_to_string(JNIEnv* env, jstring jstr) {
     if (jstr == nullptr) return "";
     const char* chars = env->GetStringUTFChars(jstr, nullptr);
@@ -37,7 +97,7 @@ std::string jstring_to_string(JNIEnv* env, jstring jstr) {
 }
 
 jstring string_to_jstring(JNIEnv* env, const std::string& str) {
-    return env->NewStringUTF(str.c_str());
+    return env->NewStringUTF(sanitize_utf8(str).c_str());
 }
 
 std::vector<std::string> jstring_array_to_string_vector(JNIEnv* env, jobjectArray jarray) {
@@ -251,6 +311,16 @@ jobject tokenize_result_to_jobject(JNIEnv* env, const capllama::llama_cap_tokeni
 static std::map<jlong, std::unique_ptr<capllama::llama_cap_context>> contexts;
 static jlong next_context_id = 1;
 
+// KvCacheQuant string -> lm_ggml_type, mirrors local-ai's LlmRuntimePort
+// KvCacheQuant union ('f16'|'q8_0'|'q4_0') exactly — unrecognized/empty
+// strings leave cparams' existing default untouched rather than guessing.
+static bool cache_type_from_string(const std::string& s, lm_ggml_type& out) {
+    if (s == "f16")  { out = LM_GGML_TYPE_F16;  return true; }
+    if (s == "q8_0") { out = LM_GGML_TYPE_Q8_0; return true; }
+    if (s == "q4_0") { out = LM_GGML_TYPE_Q4_0; return true; }
+    return false;
+}
+
 static void apply_params_from_jsobject(JNIEnv* env, jobject params, common_params& cparams) {
     if (params == nullptr) {
         return;
@@ -258,6 +328,23 @@ static void apply_params_from_jsobject(JNIEnv* env, jobject params, common_param
     cparams.embedding = jni_utils::jsobject_opt_bool(env, params, "embedding", cparams.embedding);
     cparams.use_mmap = jni_utils::jsobject_opt_bool(env, params, "use_mmap", cparams.use_mmap);
     cparams.use_mlock = jni_utils::jsobject_opt_bool(env, params, "use_mlock", cparams.use_mlock);
+    // perf-tuning plan §3/§6 (local-ai): these five were silently dropped
+    // here previously — LlamaCppCapacitorAdapter.loadModel() has sent them
+    // as n_threads/n_ubatch/flash_attn/cache_type_k/cache_type_v all along,
+    // this function just never read them. See docs/decisions.md (local-ai)
+    // 2026-08-21.
+    cparams.flash_attn = jni_utils::jsobject_opt_bool(env, params, "flash_attn", cparams.flash_attn);
+    {
+        const std::string cache_k = jni_utils::jsobject_opt_string(env, params, "cache_type_k", "");
+        lm_ggml_type parsed;
+        if (cache_type_from_string(cache_k, parsed)) {
+            cparams.cache_type_k = parsed;
+        }
+        const std::string cache_v = jni_utils::jsobject_opt_string(env, params, "cache_type_v", "");
+        if (cache_type_from_string(cache_v, parsed)) {
+            cparams.cache_type_v = parsed;
+        }
+    }
 
     jclass jsClass = env->GetObjectClass(params);
     if (jsClass != nullptr && !env->ExceptionCheck()) {
@@ -274,6 +361,16 @@ static void apply_params_from_jsobject(JNIEnv* env, jobject params, common_param
             readInt("n_ctx", cparams.n_ctx);
             readInt("n_batch", cparams.n_batch);
             readInt("n_gpu_layers", cparams.n_gpu_layers);
+            readInt("n_ubatch", cparams.n_ubatch);
+            // n_threads has no separate n_threads_batch knob on this port
+            // (LlmRuntimePort.loadModel() exposes one `threads` field) —
+            // mirror it onto both prompt and generation thread pools, same
+            // as llama.cpp's own CLI does when only `-t` is given without
+            // `-tb`.
+            int threads = cparams.cpuparams.n_threads;
+            readInt("n_threads", threads);
+            cparams.cpuparams.n_threads = threads;
+            cparams.cpuparams_batch.n_threads = threads;
         } else if (env->ExceptionCheck()) {
             env->ExceptionClear();
         }
@@ -542,7 +639,7 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_releaseContextNative(
 
 JNIEXPORT jobject JNICALL
 Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
-    JNIEnv* env, jobject thiz, jlong context_id, jobject params) {
+    JNIEnv* env, jobject thiz, jlong context_id, jint js_context_id, jobject params) {
     
     try {
         LOGI("Starting completion for context: %ld", context_id);
@@ -828,24 +925,100 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
             
             LOGI("Starting token generation loop (max tokens: %d)...", n_predict);
             
+            // Per-token streaming (docs/decisions.md's "no per-token streaming on Android,
+            // confirmed" entry, 2026-08-20): resolved once, outside the loop, so a hot
+            // GetMethodID lookup doesn't run per token. `emit_partial_completion` mirrors the
+            // JS wrapper's own `completion()` (`nativeParams.emit_partial_completion:
+            // !!callback`) — only pay for the JNI call-back when a JS-side listener is actually
+            // registered. `LlamaCpp.emitPartialToken(int, String)` forwards to
+            // `LlamaCppPlugin.notifyListeners("@LlamaCpp_onToken", ...)`; if that method is ever
+            // renamed/removed upstream this lookup fails closed (streaming silently skipped)
+            // rather than crashing generation.
+            bool emit_partial = jni_utils::jsobject_opt_bool(env, params, "emit_partial_completion", false);
+            jmethodID emit_token_method = nullptr;
+            if (emit_partial) {
+                jclass thiz_class = env->GetObjectClass(thiz);
+                emit_token_method = env->GetMethodID(thiz_class, "emitPartialToken", "(ILjava/lang/String;)V");
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    emit_token_method = nullptr;
+                }
+                if (!emit_token_method) {
+                    LOGE("LlamaCpp.emitPartialToken(int, String) not found — per-token streaming disabled for this call");
+                    emit_partial = false;
+                }
+            }
+
+            // Holds a token's raw bytes across loop iterations when they
+            // don't yet form a complete UTF-8 character (byte-level BPE
+            // tokenizers routinely split a single character — emoji/CJK/
+            // Cyrillic in particular — across several tokens). See
+            // capllama::format_token_utf8_safe()'s doc comment; reported
+            // live 2026-08-21 as literal "byte: \xNN" debug text leaking
+            // into replies before this existed.
+            std::string pending_utf8;
+
             while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
                 try {
                     LOGI("Generating token %d...", tokens_generated + 1);
                     auto token_output = ctx->completion->nextToken();
                     
+                    // nextToken() itself already checks the model's *actual*
+                    // end-of-generation token(s) via llama_vocab_is_eog() —
+                    // correct across models, unlike a hardcoded token id —
+                    // and sets has_next_token = false when generation should
+                    // stop (cap-completion.cpp). This loop wasn't checking
+                    // that at all: it only compared against a hardcoded
+                    // `tok == 2`, which isn't Qwen's (or most current
+                    // models') actual end-of-turn token. The result, live,
+                    // 2026-08-19: every single response ran the full
+                    // n_predict budget regardless of how short the model's
+                    // real answer was — several minutes per reply on this
+                    // device's CPU-only inference, even for "hi". Checking
+                    // has_next_token is the fix; the old tok==2 check is
+                    // kept as a redundant fallback in case a model somehow
+                    // resumes past its own EOG token. Ported from the
+                    // `llama-cpp-capacitor@0.1.5` patch during the
+                    // `llama-cpp-pro` migration — still present in 0.2.4;
+                    // notably `cap-ios-bridge.cpp` in this same package
+                    // already checks `has_next_token` correctly, only this
+                    // Android JNI loop didn't.
+                    if (!ctx->completion->has_next_token) {
+                        LOGI("Reached end-of-generation (has_next_token=false, stopped_eos=%d), stopping generation", ctx->completion->stopped_eos);
+                        break;
+                    }
                     // Check for end-of-sequence (simplified check)
-                    if (token_output.tok == 2) { // Most models use 2 as EOS token
+                    if (token_output.tok == 2) { // fallback: most models use 2 as EOS token
                         LOGI("Reached EOS token, stopping generation");
                         break;
                     }
                     
-                    // Convert token to text
-                    std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+                    // Convert token to text — buffers an incomplete trailing
+                    // multi-byte UTF-8 sequence in pending_utf8 rather than
+                    // emitting the raw partial bytes; token_text can
+                    // legitimately be empty on an iteration where a
+                    // character is still incomplete (see doc comment above).
+                    std::string token_text = capllama::format_token_utf8_safe(ctx->ctx, token_output.tok, pending_utf8);
                     generated_text += token_text;
                     tokens_generated++;
                     
                     LOGI("Generated token %d (ID: %d): %s", tokens_generated, token_output.tok, token_text.c_str());
                     
+                    if (emit_partial && emit_token_method && !token_text.empty()) {
+                        jstring token_jstr = jni_utils::string_to_jstring(env, token_text);
+                        env->CallVoidMethod(thiz, emit_token_method, js_context_id, token_jstr);
+                        env->DeleteLocalRef(token_jstr);
+                        if (env->ExceptionCheck()) {
+                            // A JS-side listener threw, or the bridge rejected the event —
+                            // don't let that abort generation, just stop trying to stream
+                            // for the rest of this call (the caller still gets the full
+                            // text via completionNative's normal return either way).
+                            LOGE("emitPartialToken threw for token %d — disabling streaming for the rest of this generation", tokens_generated);
+                            env->ExceptionClear();
+                            emit_partial = false;
+                        }
+                    }
+
                 } catch (const std::exception& e) {
                     LOGE("Exception during token generation %d: %s", tokens_generated + 1, e.what());
                     break;

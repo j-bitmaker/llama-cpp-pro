@@ -1012,6 +1012,16 @@ const char * llama_completion_stream(
             }
             ctx->completion->beginCompletion();
 
+            // Holds a token's raw bytes across iterations when they don't
+            // yet form a complete UTF-8 character — see
+            // capllama::format_token_utf8_safe()'s doc comment. Only the
+            // streamed `token_callback` below is affected by this on iOS
+            // (the final `generated_text` a few lines down is overwritten
+            // from `ctx->completion->generated_text`, sourced elsewhere),
+            // but a live stream leaking "byte: \xNN" mid-reply is still
+            // broken UX even if the saved message ends up fine.
+            std::string pending_utf8;
+
             while (tokens_generated < n_predict &&
                    ctx->completion->has_next_token &&
                    !ctx->completion->is_interrupted) {
@@ -1027,11 +1037,11 @@ const char * llama_completion_stream(
                 if (ctx->completion->stopped_word || ctx->completion->stopped_limit) {
                     break;
                 }
-                std::string token_text = capllama::tokens_to_output_formatted_string(
-                    ctx->ctx, token_output.tok);
+                std::string token_text = capllama::format_token_utf8_safe(
+                    ctx->ctx, token_output.tok, pending_utf8);
                 generated_text += token_text;
 
-                if (token_callback) {
+                if (token_callback && !token_text.empty()) {
 #if defined(CAPLLAMA_BUILD_WASM_JSPI) && defined(__EMSCRIPTEN__)
                     cap_wasm_jspi_token_callback(token_text.c_str(), user_data, tokens_generated);
 #else

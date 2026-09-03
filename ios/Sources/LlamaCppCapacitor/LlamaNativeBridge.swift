@@ -31,6 +31,20 @@ enum LlamaNativeBridge {
     private typealias ReleaseContextFn  = @convention(c) (Int64) -> Void
     private typealias RunCompletionFn   = @convention(c) (Int64, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
     private typealias FreeResultFn      = @convention(c) (UnsafeMutablePointer<CChar>) -> Void
+    // PATCH (2026-08-20, local-ai per-token-streaming-ios, drafted off-device — see this
+    // typealias pair's call site, runCompletionStream(), for the full TODO(mac) list):
+    // matches cpp/cap-ios-bridge.cpp's existing `llama_completion_stream`'s C signature —
+    // `const char * llama_completion_stream(int64_t context_id, const char * params_json,
+    // void (*token_callback)(const char *token_text, void *user_data, int token_index),
+    // void *user_data)`. That function already exists upstream (comment there: "Streaming
+    // completion with per-token C callback (all native/desktop targets)") — this Swift
+    // bridge just never called it before this patch. Parameter order must stay in lockstep
+    // with the C declaration; if `cap-ios-bridge.cpp` ever changes it, this silently
+    // miscompiles into a crash (dlsym has no type info to catch a mismatch), not a
+    // compile error — worth re-diffing against the C header on the next `llama-cpp-pro`
+    // version bump.
+    private typealias TokenCallback         = @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?, Int32) -> Void
+    private typealias RunCompletionStreamFn = @convention(c) (Int64, UnsafePointer<CChar>, TokenCallback?, UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
     private typealias StopCompletionFn  = @convention(c) (Int64) -> Void
     private typealias RunEmbeddingJsonFn = @convention(c) (Int64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
     private typealias JsonOpFn          = @convention(c) (Int64, UnsafePointer<CChar>, UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -104,6 +118,75 @@ enum LlamaNativeBridge {
         let fn   = try sym("llama_run_completion", RunCompletionFn.self)
         let free = try sym("llama_free_completion_result", FreeResultFn.self)
         let ptr  = paramsJson.withCString { fn(contextId, $0) }
+        guard let ptr else { throw Failure.completionFailed("nil result") }
+        defer { free(ptr) }
+        return try decodeJsonDictionary(from: ptr, failure: .completionFailed("invalid JSON"))
+    }
+
+    // PATCH (2026-08-20, local-ai per-token-streaming-ios): per-token sibling of
+    // runCompletion() above, added to close the gap docs/decisions.md's "iOS:
+    // notifyListeners unimplemented..." entry logged (2026-08-20) — the JS wrapper
+    // (dist/esm/index.js) has always expected native per-token events, iOS just never sent
+    // any. Wraps `llama_completion_stream`, NOT a new native code path — see the
+    // typealias doc comment above for why no C++ changes were needed for this half of the
+    // fix.
+    //
+    // TODO(mac), in order of what would actually break this:
+    // 1. `sym("llama_completion_stream", ...)` may throw `.missingSymbol` if the currently
+    //    vendored `ios/Frameworks/llama-cpp.xcframework` predates this function being
+    //    compiled in. If so: `bash scripts/ensure-llama-ios-xcframework.sh` won't
+    //    necessarily rebuild it on its own — that script short-circuits on a cached
+    //    xcframework unless `EXPECTED_BUILD_PROFILE` changed (see the script), so you may
+    //    need to `rm -rf ios/Frameworks/llama-cpp.xcframework` first, or bump that
+    //    constant, to force a real rebuild against the current cpp/ sources. This patch's
+    //    LlamaCpp.swift call site already falls back to the non-streaming runCompletion()
+    //    on `.missingSymbol` (fails closed, same shape as Android's "method not found"
+    //    fallback), so a stale xcframework degrades to today's behavior rather than
+    //    crashing — but per-token streaming silently won't happen until it's rebuilt.
+    // 2. The C callback fires from wherever `llama_completion_stream`'s internal generation
+    //    loop runs (same background thread `LlamaCpp.completion()` already dispatches
+    //    onto, DispatchQueue.global(qos: .userInitiated) — see that file). Confirm
+    //    `Plugin.notifyListeners()` (called from `onPartialToken` in
+    //    LlamaCppPlugin.swift) is actually safe to call off the main thread — if not,
+    //    that closure needs a `DispatchQueue.main.async` hop.
+    // 3. `llama_completion_stream`'s result JSON (cap-ios-bridge.cpp, ~line 1067) always
+    //    sets `reasoning_content: ""` and doesn't run getPartialOutput()'s chat-format
+    //    parsing the way `llama_run_completion` does — the TS-side adapter
+    //    (llama-cpp-capacitor.adapter.ts's splitReasoningContent()) already nets raw
+    //    `<think>` blocks as a fallback, so this is expected to be harmless, but worth
+    //    an eyeball on a real `<think>`-using model.
+    // 4. Not verified: whether `llama_completion_stream` honors the same stop-word /
+    //    stopping_word bookkeeping `llama_run_completion` does (its result always reports
+    //    `stopped_word: ""`, `stopping_word: ""`) — check if any of local-ai's/the
+    //    consuming app's prompts actually depend on `stop` params for early termination
+    //    before trusting this path for those.
+    static func runCompletionStream(
+        contextId: Int64,
+        paramsJson: String,
+        onToken: @escaping (String) -> Void
+    ) throws -> [String: Any] {
+        let fn   = try sym("llama_completion_stream", RunCompletionStreamFn.self)
+        let free = try sym("llama_free_completion_result", FreeResultFn.self)
+
+        // Boxes the Swift closure so it can cross the C ABI as a `void *user_data` —
+        // `@convention(c)` function pointers can't capture Swift context directly.
+        // `passRetained`/`release()` keep the box alive exactly for this call's duration
+        // regardless of which exit path (success/throw) is taken.
+        final class TokenBox {
+            let onToken: (String) -> Void
+            init(_ f: @escaping (String) -> Void) { onToken = f }
+        }
+        let box = TokenBox(onToken)
+        let userData = Unmanaged.passRetained(box).toOpaque()
+        defer { Unmanaged<TokenBox>.fromOpaque(userData).release() }
+
+        let trampoline: TokenCallback = { tokenPtr, userData, _ in
+            guard let tokenPtr, let userData else { return }
+            let token = String(cString: tokenPtr)
+            Unmanaged<TokenBox>.fromOpaque(userData).takeUnretainedValue().onToken(token)
+        }
+
+        let ptr = paramsJson.withCString { fn(contextId, $0, trampoline, userData) }
         guard let ptr else { throw Failure.completionFailed("nil result") }
         defer { free(ptr) }
         return try decodeJsonDictionary(from: ptr, failure: .completionFailed("invalid JSON"))

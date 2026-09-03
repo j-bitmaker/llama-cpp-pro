@@ -254,6 +254,10 @@ public class LlamaCpp {
     private Context context;
     // Memory admission control (parity with the Web DefaultModelScheduler).
     private final ModelAdmissionController admissionController;
+    // Set by LlamaCppPlugin so emitPartialToken() below can reach notifyListeners() — see that
+    // method's own doc comment. Never null in production (LlamaCppPlugin.load() always passes
+    // itself); nullable only so existing single-arg-constructor call sites/tests don't break.
+    private LlamaCppPlugin plugin;
 
     // Constructor to receive context
     public LlamaCpp(Context context) {
@@ -261,10 +265,21 @@ public class LlamaCpp {
         this.admissionController = new ModelAdmissionController(context);
     }
 
+    public LlamaCpp(Context context, LlamaCppPlugin plugin) {
+        this(context);
+        this.plugin = plugin;
+    }
+
     // Native method declarations
     private native long initContextNative(String modelPath, String[] searchPaths, JSObject params);
     private native void releaseContextNative(long nativeContextId);
-    private native Map<String, Object> completionNative(long contextId, JSObject params);
+    // `contextId` (JS-level, routes the JS wrapper's per-context EVENT_ON_TOKEN listener —
+    // dist/esm/index.js's `completion()`: `if (contextId !== this.id) return;`) is a *new* param
+    // here, plumbed through purely so emitPartialToken() below (called from jni.cpp's token loop)
+    // knows which JS-side id to stamp on the event; `nativeContextId` (the existing long handle)
+    // still identifies the actual llama_context. See docs/decisions.md's "no per-token streaming
+    // on Android" entry for why this didn't exist before 2026-08-20.
+    private native Map<String, Object> completionNative(long nativeContextId, int contextId, JSObject params);
     private native Map<String, Object> modelInfoNative(String modelPath);
     private native void stopCompletionNative(long contextId);
     private native String getFormattedChatNative(long contextId, String messages, String chatTemplate);
@@ -745,7 +760,7 @@ public class LlamaCpp {
             Log.i(TAG, "Starting completion for context: " + contextId);
             
             // Call native completion with full params
-            Map<String, Object> result = completionNative(context.getNativeContextId(), params);
+            Map<String, Object> result = completionNative(context.getNativeContextId(), contextId, params);
             
             if (result != null) {
                 Log.i(TAG, "Completion completed successfully");
@@ -758,6 +773,28 @@ public class LlamaCpp {
         } catch (Exception e) {
             callback.onResult(LlamaResult.failure(new LlamaError("Completion failed: " + e.getMessage())));
         }
+    }
+
+    /**
+     * Called from native code only (jni.cpp's token-generation loop in
+     * `completionNative`, one `CallVoidMethod` per generated token, gated on the
+     * request's `emit_partial_completion` param) — never call this from Java.
+     * Forwards to the Capacitor bridge as `@LlamaCpp_onToken`, matching the
+     * event name/payload shape `dist/esm/index.js`'s `completion()` already
+     * listens for (`{ contextId, tokenResult: { token } }`) — that JS-side
+     * wiring predates this method and was already correct; only this native
+     * emission was missing. See docs/decisions.md's "no per-token streaming on
+     * Android, confirmed" (2026-08-20) entry for the investigation that found
+     * the gap, and its follow-up entry for this fix.
+     */
+    public void emitPartialToken(int contextId, String token) {
+        if (plugin == null) return;
+        JSObject tokenResult = new JSObject();
+        tokenResult.put("token", token);
+        JSObject event = new JSObject();
+        event.put("contextId", contextId);
+        event.put("tokenResult", tokenResult);
+        plugin.emitTokenEvent(event);
     }
 
     public void stopCompletion(int contextId, LlamaCallback<Void> callback) {
@@ -820,7 +857,7 @@ public class LlamaCpp {
             }
             
             // Call native completion
-            Map<String, Object> result = completionNative(context.getNativeContextId(), completionParams);
+            Map<String, Object> result = completionNative(context.getNativeContextId(), contextId, completionParams);
             
             if (result != null) {
                 Log.i(TAG, "Chat completed successfully");
@@ -878,7 +915,7 @@ public class LlamaCpp {
             }
             
             // Call native completion
-            Map<String, Object> result = completionNative(context.getNativeContextId(), completionParams);
+            Map<String, Object> result = completionNative(context.getNativeContextId(), contextId, completionParams);
             
             if (result != null) {
                 Log.i(TAG, "Text generation completed successfully");
