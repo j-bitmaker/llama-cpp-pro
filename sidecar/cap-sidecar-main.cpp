@@ -1,13 +1,8 @@
 /**
  * Standalone desktop sidecar entry point.
  *
- * Loads optional ggml GPU backend plugins (libggml-vulkan.so, ggml-openvino.dll, …)
- * from --backend-dir (preferred) and/or the executable directory, then runs
- * cap_llama_server_main until SIGINT/SIGTERM.
- *
- * IMPORTANT: backends must be loaded BEFORE llama_backend_init(). That function
- * only auto-loads when no backends are registered yet; loading twice (exe dir +
- * plugin dir) registers duplicate Vulkan devices and corrupts the heap.
+ * Loads optional ggml GPU backend plugins (libggml-vulkan.so, libggml-cuda.so, …)
+ * from the executable directory, then runs cap_llama_server_main until SIGINT/SIGTERM.
  */
 
 #include "cap-native-server.h"
@@ -19,7 +14,6 @@
 #include <csignal>
 #include <cstring>
 #include <filesystem>
-#include <string>
 #include <thread>
 
 namespace {
@@ -47,48 +41,17 @@ const char * resolve_backend_dir(int argc, char ** argv) {
     return nullptr;
 }
 
-std::string exe_directory(char ** argv) {
-    try {
-        if (argv && argv[0] && argv[0][0]) {
-            return std::filesystem::absolute(argv[0]).parent_path().string();
-        }
-    } catch (...) { /* fall through */ }
-    return {};
-}
-
-/**
- * Load backend plugins once, from a single directory preference order:
- *   1. --backend-dir (GPU/NPU plugins staged by the Electron host)
- *   2. directory of this executable (CPU + any bundled plugins)
- *
- * GPU plugin DLLs should NOT also sit next to the exe when --backend-dir is
- * used — otherwise load_best can pick them up a second time.
- */
 void load_dynamic_backends(int argc, char ** argv) {
-    const char * plugin_dir = resolve_backend_dir(argc, argv);
-    if (plugin_dir && plugin_dir[0]) {
-        ggml_backend_load_all_from_path(plugin_dir);
-    }
-    // Always also try the exe directory so ggml-cpu (and shared ggml) resolve
-    // when plugins live in a separate folder. load_best will still re-scan;
-    // keep GPU plugins out of the exe dir to avoid duplicate Vulkan regs.
-    const std::string exe_dir = exe_directory(argv);
-    if (!exe_dir.empty() && !(plugin_dir && exe_dir == plugin_dir)) {
-        ggml_backend_load_all_from_path(exe_dir.c_str());
-    }
-    if (!plugin_dir && exe_dir.empty()) {
-        ggml_backend_load_all_from_path(nullptr);
-    }
+    const char * dir = resolve_backend_dir(argc, argv);
+    lm_ggml_backend_load_all_from_path(dir);
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
     install_signal_handlers();
-
-    // Register backends first so llama_backend_init() skips its default scan.
-    load_dynamic_backends(argc, argv);
     llama_backend_init();
+    load_dynamic_backends(argc, argv);
 
     if (cap_llama_server_main(argc, argv) != 0) {
         llama_backend_free();

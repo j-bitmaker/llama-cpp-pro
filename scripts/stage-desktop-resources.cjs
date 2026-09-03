@@ -49,16 +49,12 @@ function copyDir(src, dst, filter) {
 
 const BIN_PATTERNS = [
   /^darwin-(arm64|x64)$/,
-  /^linux-x64(-(rocm|cuda|vulkan|openblas|openvino|cpu))?$/,
-  /^win32-x64(-(rocm|cuda|vulkan|vulkan-openblas|openblas|openvino|cpu))?\.exe$/,
+  /^linux-x64(-(rocm|cuda|vulkan|openblas))?$/,
+  /^win32-x64(-(rocm|cuda|vulkan|openblas))?\.exe$/,
 ];
 
 function shouldCopyBin(name) {
   return BIN_PATTERNS.some((re) => re.test(name));
-}
-
-function isGpuBackendPlugin(name) {
-  return /ggml-(vulkan|cuda|hip|openvino|metal|blas)/i.test(name);
 }
 
 function stageSidecarBins() {
@@ -69,14 +65,8 @@ function stageSidecarBins() {
   mkdirp(dstRoot);
   let copied = 0;
   for (const name of fs.readdirSync(srcBin)) {
-    if (!shouldCopyBin(name) && !/\.(dll|so|dylib)$/i.test(name)) continue;
-    // GPU plugins must live under ggml-plugins/ only — never next to the exe.
-    if (isGpuBackendPlugin(name)) continue;
-    if (onlyPlatform && !name.startsWith(onlyPlatform) && !/\.(dll|so|dylib)$/i.test(name)) {
-      // Always allow runtime DLLs (e.g. libopenblas.dll) regardless of --platform filter.
-      if (!/\.(dll|so|dylib)$/i.test(name)) continue;
-    }
-    if (onlyPlatform && shouldCopyBin(name) && !name.startsWith(onlyPlatform)) continue;
+    if (!shouldCopyBin(name)) continue;
+    if (onlyPlatform && !name.startsWith(onlyPlatform)) continue;
     const ok = copyFile(path.join(srcBin, name), path.join(dstRoot, name));
     if (ok) {
       copied += 1;
@@ -87,24 +77,11 @@ function stageSidecarBins() {
 }
 
 function stageGgmlPlugins() {
-  // Prefer staged plugins under sidecar/bin/ggml-plugins/**
   const srcPlugins = path.join(srcBin, 'ggml-plugins');
-  let n = 0;
-  if (fs.existsSync(srcPlugins)) {
-    n += copyDir(srcPlugins, path.join(dstRoot, 'ggml-plugins'), (name) =>
-      /\.(so|dll|dylib)$/i.test(name) || !name.includes('.'),
-    );
-  }
-  // Also pick up cmake copy folder if present (pre-stage)
-  const buildPlugins = path.join(root, 'sidecar', 'build', 'ggml-plugins');
-  if (fs.existsSync(buildPlugins)) {
-    const plat = onlyPlatform || (process.platform === 'win32' ? 'win32' : process.platform);
-    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-    const dest = path.join(dstRoot, 'ggml-plugins', `${plat}-${arch}`);
-    n += copyDir(buildPlugins, dest, (name) => /\.(so|dll|dylib)$/i.test(name));
-  }
-  if (n > 0) console.log(`  staged ${n} ggml plugin file(s)`);
-  return n;
+  if (!fs.existsSync(srcPlugins)) return 0;
+  return copyDir(srcPlugins, path.join(dstRoot, 'ggml-plugins'), (n) =>
+    /\.(so|dll|dylib)/i.test(n) || !n.includes('.'),
+  );
 }
 
 function stageRuntimeLibs() {
@@ -113,16 +90,6 @@ function stageRuntimeLibs() {
   return copyDir(srcLibs, path.join(dstRoot, 'runtime-libs'), (n) =>
     /\.(so|dll|dylib)/i.test(n) || !n.includes('.'),
   );
-}
-
-function stageOpenVinoRuntime() {
-  const src = path.join(srcBin, 'openvino-runtime');
-  if (!fs.existsSync(src)) return 0;
-  const n = copyDir(src, path.join(dstRoot, 'openvino-runtime'), (name) =>
-    /\.(dll|so(\.\d+)*)$/i.test(name),
-  );
-  if (n > 0) console.log(`  staged ${n} OpenVINO runtime file(s)`);
-  return n;
 }
 
 function stageWasm() {
@@ -135,34 +102,13 @@ function stageWasm() {
   return copyDir(srcWasm, dstWasm);
 }
 
-function promoteDefaultWinSidecar() {
-  const preferred = path.join(dstRoot, 'win32-x64.exe');
-  if (fs.existsSync(preferred)) return;
-  for (const alt of [
-    'win32-x64-cpu.exe',
-    'win32-x64-vulkan-openblas.exe',
-    'win32-x64-vulkan.exe',
-    'win32-x64-openvino.exe',
-    'win32-x64-openblas.exe',
-  ]) {
-    const src = path.join(dstRoot, alt);
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, preferred);
-      console.log(`  promoted ${alt} → win32-x64.exe`);
-      return;
-    }
-  }
-}
-
 console.log('Staging desktop resources...');
 const bins = stageSidecarBins();
-promoteDefaultWinSidecar();
 const plugins = stageGgmlPlugins();
 const libs = stageRuntimeLibs();
-const ov = stageOpenVinoRuntime();
 const wasm = stageWasm();
 
-console.log(`Done: ${bins} sidecar binary(ies), ${plugins} plugin file(s), ${libs} runtime lib(s), ${ov} openvino file(s), ${wasm} wasm file(s)`);
+console.log(`Done: ${bins} sidecar binary(ies), ${plugins} plugin file(s), ${libs} runtime lib(s), ${wasm} wasm file(s)`);
 
 if (bins === 0) {
   console.error('No sidecar binaries staged.');
