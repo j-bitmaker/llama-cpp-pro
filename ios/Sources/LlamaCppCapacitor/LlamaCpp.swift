@@ -456,7 +456,7 @@ struct MinjaCaps {
         }
         
         // Query GPU info from native layer
-        let gpuInfo = LlamaNativeBridge.queryGpuInfo(nativeContextId)
+        let gpuInfo = LlamaNativeBridge.queryGpuInfo(contextId: nativeContextId)
         let gpuEnabled = gpuInfo.gpu
         let reasonNoGPU = gpuEnabled ? "" : (gpuInfo.reason.isEmpty ? "Metal not used" : gpuInfo.reason)
 
